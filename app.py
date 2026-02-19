@@ -3,121 +3,75 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import date
 
-FRED_BASE = "https://api.stlouisfed.org/fred"
+# Download der Excel-Datei von der Philly Fed
+EXCEL_URL = "https://www.philadelphiafed.org/-/media/FRBP/Assets/Surveys-And-Data/real-time-data/data-files/xlsx/ROUTPUTQvQd.xlsx?sc_lang=en&hash=34FA1C6BF0007996E1885C8C32E3BEF9"
 
-st.set_page_config(page_title="Macro Vintage Dashboard (First Release)", layout="wide")
+# Excel herunterladen
+def download_excel(url):
+    response = requests.get(url)
+    response.raise_for_status()  # sicherstellen, dass der Download erfolgreich war
+    with open("/mnt/data/ROUTPUTQvQd.xlsx", "wb") as file:
+        file.write(response.content)
+    return "/mnt/data/ROUTPUTQvQd.xlsx"
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def fred_get(endpoint: str, params: dict) -> dict:
-    url = f"{FRED_BASE}/{endpoint}"
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+# Daten aus Excel-Datei lesen
+@st.cache_data(ttl=6 * 60 * 60)  # Cache für 6 Stunden
+def load_and_process_data():
+    # Lade Excel-Datei
+    excel_path = download_excel(EXCEL_URL)
+    xls = pd.ExcelFile(excel_path)
 
-@st.cache_data(ttl=6 * 60 * 60)  # 6h Cache
-def fetch_first_release_series(series_id: str, api_key: str) -> pd.DataFrame:
-    """
-    Returns a DataFrame indexed by observation date with:
-    - value_first: first release value (earliest vintage)
-    - vintage_first: realtime_start of that first release
-    """
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        # Pull full real-time history so we can select earliest vintage per obs date
-        "realtime_start": "1776-07-04",
-        "realtime_end": "9999-12-31",
-    }
+    # Schätze die Blattnamen, normalerweise `ROUTPUT`
+    sheet_name = xls.sheet_names[0]
 
-    data = fred_get("series/observations", params)
-    obs = pd.DataFrame(data["observations"])
+    # Lade die Daten
+    df = pd.read_excel(xls, sheet_name=sheet_name, header=3)  # Übliche Header-Position bei Philly Fed
+    
+    # Bereinige und formatiere die Daten
+    df = df.dropna(how='all')  # Leere Zeilen entfernen
+    df = df.rename(columns={df.columns[0]: 'Date'})  # Der erste Spaltenname ist 'Date'
+    
+    # Konvertiere alle Vintages in numerische Werte, Fehler werden als NaN behandelt
+    df.iloc[:, 1:] = df.iloc[:, 1:].apply(pd.to_numeric, errors='coerce')
 
-    # Clean / types
-    obs["date"] = pd.to_datetime(obs["date"])
-    obs["realtime_start"] = pd.to_datetime(obs["realtime_start"])
-    obs["value"] = pd.to_numeric(obs["value"], errors="coerce")
+    # Konvertiere die 'Date'-Spalte in datetime
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
 
-    obs = obs.dropna(subset=["value"])
+    # Entferne Zeilen mit ungültigen oder leeren Daten
+    df = df.dropna(subset=['Date'])
+    
+    return df
 
-    # Pick earliest realtime_start per observation date
-    idx = obs.groupby("date")["realtime_start"].idxmin()
-    first = obs.loc[idx, ["date", "value", "realtime_start"]].sort_values("date")
+# ---------------------------------
+# Funktion zum Berechnen von QoQ
+# ---------------------------------
+def calc_qoq_saar(df):
+    df = df.sort_index()  # Sicherstellen, dass wir nach Datum sortieren
 
-    first = first.rename(columns={"value": "value_first", "realtime_start": "vintage_first"})
-    first = first.set_index("date")
-    return first
-
-def add_transforms_q(series: pd.Series, z_window_quarters: int = 40) -> pd.DataFrame:
-    """
-    Quarterly transforms:
-    - YoY%: 4-quarter pct change
-    - QoQ SAAR%: ((x/x(-1))^4 - 1)*100
-    - Z-score: rolling z on YoY%
-    """
-    df = pd.DataFrame({"level": series})
-
-    df["yoy_pct"] = 100 * (df["level"] / df["level"].shift(4) - 1.0)
-    df["qoq_saar_pct"] = 100 * ((df["level"] / df["level"].shift(1)) ** 4 - 1.0)
-
-    # z-score on YoY% (common macro choice); you can change to level if desired
-    mu = df["yoy_pct"].rolling(z_window_quarters).mean()
-    sd = df["yoy_pct"].rolling(z_window_quarters).std(ddof=0)
-    df["z_yoy"] = (df["yoy_pct"] - mu) / sd
+    # Berechne QoQ für jedes Quartal
+    df['qoq_saar'] = ((df['value_first'] / df['value_first'].shift(1)) ** 4 - 1) * 100
 
     return df
 
-# -----------------------------
-# UI
-# -----------------------------
+# ---------------------------------
+# Daten anzeigen und verarbeiten
+# ---------------------------------
+df = load_and_process_data()
+
+# Speichern der jeweils **aktuellsten Werte** für jedes Quartal
+df['value_first'] = df.iloc[:, 1:].max(axis=1)  # Max aus allen Vintages, um den letzten (aktuellsten) Wert zu nehmen
+
+# Berechne QoQ Veränderung mit den richtigen aktuellsten Werten
+df = calc_qoq_saar(df)
+
+# Zeige das Dashboard
 st.title("Macro Dashboard – First Release / Vintage-sicher")
 
-api_key = st.secrets.get("FRED_API_KEY") or os.getenv("FRED_API_KEY")
-if not api_key:
-    st.error("Bitte FRED_API_KEY als Streamlit Secret oder Environment Variable setzen.")
-    st.stop()
+# Zeige die Daten
+st.subheader("Daten und QoQ Berechnungen")
+st.write(df)
 
-series_id = st.sidebar.text_input("Series ID", value="GDPC1")
-z_years = st.sidebar.slider("Z-Score Window (Jahre)", min_value=5, max_value=25, value=10, step=1)
-z_window_quarters = z_years * 4
-
-st.sidebar.caption("First Release = je Datum frühester realtime_start (ältestes Vintage).")
-
-first = fetch_first_release_series(series_id, api_key)
-trans = add_transforms_q(first["value_first"], z_window_quarters=z_window_quarters)
-
-# Merge for display
-out = first.join(trans, how="left")
-
-# -----------------------------
-# Layout
-# -----------------------------
-c1, c2, c3 = st.columns(3)
-c1.metric("Serie", series_id)
-c2.metric("Beobachtungen", f"{out.shape[0]:,}")
-c3.metric("Letztes Datum", out.index.max().date().isoformat() if len(out) else "-")
-
-st.subheader("Level (First Release)")
-st.line_chart(out["value_first"])
-
-st.subheader("Wachstum & Z-Scores (auf First Release gerechnet)")
-colA, colB = st.columns(2)
-with colA:
-    st.caption("YoY %")
-    st.line_chart(out["yoy_pct"])
-with colB:
-    st.caption("QoQ SAAR %")
-    st.line_chart(out["qoq_saar_pct"])
-
-st.caption(f"Z-Score auf YoY% (Rolling {z_years} Jahre)")
-st.line_chart(out["z_yoy"])
-
-with st.expander("Daten-Tabelle (First Release + Vintage-Datum)", expanded=False):
-    st.dataframe(
-        out[["value_first", "vintage_first", "yoy_pct", "qoq_saar_pct", "z_yoy"]].tail(200),
-        use_container_width=True
-    )
+# Visualisierung der QoQ Veränderung
+st.subheader("QoQ Veränderung")
+st.line_chart(df.set_index('Date')['qoq_saar'])
