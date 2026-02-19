@@ -1,9 +1,3 @@
-
-try:
-    import imghdr
-except ImportError:
-    import PIL.Image as imghdr
-
 import os
 import requests
 import pandas as pd
