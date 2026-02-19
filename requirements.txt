@@ -1,7 +1,4 @@
-openpyxl
+streamlit
 pandas
+openpyxl
 requests
-numpy
-streamlit==1.19.0
-altair==4.1.0
-Pillow
