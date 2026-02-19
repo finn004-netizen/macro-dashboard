@@ -2,6 +2,6 @@ openpyxl
 pandas
 requests
 numpy
-streamlit
+streamlit==1.18.0
 altair==4.1.0
 Pillow
