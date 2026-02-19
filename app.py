@@ -1,3 +1,9 @@
+
+try:
+    import imghdr
+except ImportError:
+    import PIL.Image as imghdr
+
 import os
 import requests
 import pandas as pd
@@ -76,4 +82,4 @@ st.write(df)
 
 # Visualisierung der QoQ Veränderung
 st.subheader("QoQ Veränderung")
-st.line_chart(df.set_index('Date')['qoq_saar'])
+st.line_chart(df.set_index('Date')['qoq_saar'])try:
