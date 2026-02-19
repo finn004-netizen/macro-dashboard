@@ -11,9 +11,11 @@ EXCEL_URL = "https://www.philadelphiafed.org/-/media/FRBP/Assets/Surveys-And-Dat
 def download_excel(url):
     response = requests.get(url)
     response.raise_for_status()  # sicherstellen, dass der Download erfolgreich war
-    with open("/mnt/data/ROUTPUTQvQd.xlsx", "wb") as file:
+    # Streamlit erlaubt es uns, die Datei temporär zu speichern, ohne in '/mnt/data' zu speichern.
+    file_path = "ROUTPUTQvQd.xlsx"
+    with open(file_path, "wb") as file:
         file.write(response.content)
-    return "/mnt/data/ROUTPUTQvQd.xlsx"
+    return file_path
 
 # Daten aus Excel-Datei lesen
 @st.cache_data(ttl=6 * 60 * 60)  # Cache für 6 Stunden
