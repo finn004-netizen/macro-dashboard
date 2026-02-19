@@ -1,79 +1,142 @@
-import os
+import io
 import requests
 import pandas as pd
-import numpy as np
 import streamlit as st
 
-# Download der Excel-Datei von der Philly Fed
+# Philly Fed RTDSM Excel (Real Output)
 EXCEL_URL = "https://www.philadelphiafed.org/-/media/FRBP/Assets/Surveys-And-Data/real-time-data/data-files/xlsx/ROUTPUTQvQd.xlsx?sc_lang=en&hash=34FA1C6BF0007996E1885C8C32E3BEF9"
 
-# Excel herunterladen
-def download_excel(url):
-    response = requests.get(url)
-    response.raise_for_status()  # sicherstellen, dass der Download erfolgreich war
-    # Streamlit erlaubt es uns, die Datei temporär zu speichern, ohne in '/mnt/data' zu speichern.
-    file_path = "ROUTPUTQvQd.xlsx"
-    with open(file_path, "wb") as file:
-        file.write(response.content)
-    return file_path
 
-# Daten aus Excel-Datei lesen
-@st.cache_data(ttl=6 * 60 * 60)  # Cache für 6 Stunden
-def load_and_process_data():
-    # Lade Excel-Datei
-    excel_path = download_excel(EXCEL_URL)
-    xls = pd.ExcelFile(excel_path)
+st.set_page_config(page_title="Macro Dashboard", layout="wide")
 
-    # Schätze die Blattnamen, normalerweise `ROUTPUT`
-    sheet_name = xls.sheet_names[0]
 
-    # Lade die Daten
-    df = pd.read_excel(xls, sheet_name=sheet_name, header=3)  # Übliche Header-Position bei Philly Fed
-    
-    # Bereinige und formatiere die Daten
-    df = df.dropna(how='all')  # Leere Zeilen entfernen
-    df = df.rename(columns={df.columns[0]: 'Date'})  # Der erste Spaltenname ist 'Date'
-    
-    # Konvertiere alle Vintages in numerische Werte, Fehler werden als NaN behandelt
-    df.iloc[:, 1:] = df.iloc[:, 1:].apply(pd.to_numeric, errors='coerce')
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)  # Cache 6 Stunden
+def download_excel_bytes(url: str) -> bytes:
+    # timeout ist wichtig, damit Deploys nicht „hängen“
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
 
-    # Konvertiere die 'Date'-Spalte in datetime
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
 
-    # Entferne Zeilen mit ungültigen oder leeren Daten
-    df = df.dropna(subset=['Date'])
-    
+def parse_quarter_dates(date_series: pd.Series) -> pd.Series:
+    """
+    Philly-Fed-RTDSM hat oft Quartalsformate wie '1965:Q1' oder '1965Q1'.
+    pd.to_datetime() kann das nicht direkt -> wir ergänzen robustes Parsing.
+    """
+    # Erst normal probieren
+    dt = pd.to_datetime(date_series, errors="coerce")
+
+    # Für alles, was noch NaT ist: Quarter-Strings extrahieren (YYYY:Qn / YYYYQn / YYYY-Qn)
+    missing = dt.isna()
+    if missing.any():
+        s = date_series.astype(str).str.strip()
+        extracted = s.str.extract(r"^(?P<year>\d{4})\s*[:\-/ ]?\s*Q(?P<q>[1-4])$", expand=True)
+        qmask = missing & extracted["year"].notna()
+
+        if qmask.any():
+            periods = pd.PeriodIndex(
+                extracted.loc[qmask, "year"] + "Q" + extracted.loc[qmask, "q"],
+                freq="Q",
+            )
+            # Quarter-End als Datum (00:00 Uhr) -> gut für Charts
+            dt.loc[qmask] = periods.to_timestamp(how="end").normalize()
+
+    return dt
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def load_and_process_data() -> pd.DataFrame:
+    content = download_excel_bytes(EXCEL_URL)
+    xls = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+
+    # Meist ist das erste Sheet richtig; falls 'ROUTPUT' existiert, nehmen wir das gezielt
+    sheet = "ROUTPUT" if "ROUTPUT" in xls.sheet_names else xls.sheet_names[0]
+
+    # Philly Fed Dateien haben oft Meta-Zeilen oben. Wir probieren ein paar Header-Offsets.
+    df = None
+    last_err = None
+    for header in (3, 2, 0):
+        try:
+            tmp = pd.read_excel(xls, sheet_name=sheet, header=header, engine="openpyxl")
+            if tmp.shape[1] >= 2:
+                df = tmp
+                break
+        except Exception as e:
+            last_err = e
+
+    if df is None:
+        raise RuntimeError(f"Konnte Excel nicht einlesen. Letzter Fehler: {last_err}")
+
+    # Leere Zeilen/Spalten raus
+    df = df.dropna(how="all").dropna(axis=1, how="all")
+
+    # Erste Spalte als Date
+    df = df.rename(columns={df.columns[0]: "Date"})
+    df["Date"] = parse_quarter_dates(df["Date"])
+    df = df.dropna(subset=["Date"])
+
+    # Alle anderen Spalten numerisch machen (Vintages)
+    value_cols = [c for c in df.columns if c != "Date"]
+    df[value_cols] = df[value_cols].apply(pd.to_numeric, errors="coerce")
+
+    # Spalten entfernen, die komplett leer sind
+    df = df.dropna(axis=1, how="all")
+
     return df
 
-# ---------------------------------
-# Funktion zum Berechnen von QoQ
-# ---------------------------------
-def calc_qoq_saar(df):
-    df = df.sort_index()  # Sicherstellen, dass wir nach Datum sortieren
 
-    # Berechne QoQ für jedes Quartal
-    df['qoq_saar'] = ((df['value_first'] / df['value_first'].shift(1)) ** 4 - 1) * 100
+def pick_vintage_values(df: pd.DataFrame, mode: str) -> pd.Series:
+    """
+    mode='latest' -> pro Quartal den aktuellsten verfügbaren Wert (letzte nicht-NaN Vintage)
+    mode='first'  -> pro Quartal die erste verfügbare Schätzung (erste nicht-NaN Vintage)
+    """
+    value_cols = [c for c in df.columns if c != "Date"]
+    data = df[value_cols].dropna(axis=1, how="all")
 
-    return df
+    if data.shape[1] == 0:
+        return pd.Series([float("nan")] * len(df), index=df.index)
 
-# ---------------------------------
-# Daten anzeigen und verarbeiten
-# ---------------------------------
-df = load_and_process_data()
+    if mode == "latest":
+        return data.ffill(axis=1).iloc[:, -1]
 
-# Speichern der jeweils **aktuellsten Werte** für jedes Quartal
-df['value_first'] = df.iloc[:, 1:].max(axis=1)  # Max aus allen Vintages, um den letzten (aktuellsten) Wert zu nehmen
+    if mode == "first":
+        return data.bfill(axis=1).iloc[:, 0]
 
-# Berechne QoQ Veränderung mit den richtigen aktuellsten Werten
-df = calc_qoq_saar(df)
+    raise ValueError("mode muss 'latest' oder 'first' sein")
 
-# Zeige das Dashboard
-st.title("Macro Dashboard – First Release / Vintage-sicher")
 
-# Zeige die Daten
-st.subheader("Daten und QoQ Berechnungen")
-st.write(df)
+def calc_qoq_saar(level_series: pd.Series) -> pd.Series:
+    # QoQ SAAR: ((x_t / x_{t-1})^4 - 1) * 100
+    return ((level_series / level_series.shift(1)) ** 4 - 1) * 100
 
-# Visualisierung der QoQ Veränderung
-st.subheader("QoQ Veränderung")
-st.line_chart(df.set_index('Date')['qoq_saar'])try:
+
+# ---------------- UI ----------------
+st.title("Macro Dashboard – Philly Fed RTDSM (Vintage-sicher)")
+
+with st.sidebar:
+    st.markdown("### Einstellungen")
+    choice = st.radio(
+        "Welche Vintage-Reihe verwenden?",
+        ("Latest (aktuellster Wert je Quartal)", "First release (erste Schätzung je Quartal)"),
+    )
+    mode = "latest" if choice.startswith("Latest") else "first"
+
+try:
+    raw = load_and_process_data()
+except Exception as e:
+    st.error(f"Fehler beim Laden der Philly-Fed-Excel-Datei: {e}")
+    st.stop()
+
+df = raw.copy()
+df["value"] = pick_vintage_values(df, mode=mode)
+df = df.sort_values("Date")
+df["qoq_saar"] = calc_qoq_saar(df["value"])
+
+st.subheader("QoQ SAAR (annualisiert)")
+st.line_chart(df.set_index("Date")["qoq_saar"])
+
+st.subheader("Auszug")
+st.dataframe(df[["Date", "value", "qoq_saar"]], use_container_width=True)
+
+with st.expander("Rohdaten inkl. Vintagespalten"):
+    st.dataframe(df, use_container_width=True)
